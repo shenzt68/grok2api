@@ -6,9 +6,10 @@ from typing import Any
 
 import orjson
 
+from app.platform.errors import UpstreamError
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
-from app.control.model.enums import ModeId, MODE_STRINGS
+from app.control.model.enums import ModeId
 from app.dataplane.reverse.protocol.xai_chat_reasoning import ReasoningAggregator
 
 
@@ -49,7 +50,7 @@ def build_chat_payload(
         "imageGenerationCount":        2,
         "isAsyncChat":                 False,
         "message":                     message,
-        "modeId":                      MODE_STRINGS[mode_id],
+        "modeId":                      mode_id.to_api_str(),
         "responseMetadata":            {},
         "returnImageBytes":            False,
         "returnRawGrokInXaiRequest":   False,
@@ -77,7 +78,7 @@ def build_chat_payload(
 
     logger.debug(
         "chat payload built: mode={} message_len={} file_count={}",
-        MODE_STRINGS[mode_id], len(message), len(file_attachments),
+        mode_id.to_api_str(), len(message), len(file_attachments),
     )
     return payload
 
@@ -111,6 +112,46 @@ def classify_line(line: str | bytes) -> tuple[str, str]:
     if line.startswith("{"):
         return "data", line
     return "skip", ""
+
+
+def stream_error_from_payload(obj: dict[str, Any]) -> UpstreamError | None:
+    """Convert upstream in-band stream error payloads to retryable errors."""
+    error = obj.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    raw_message = error.get("message") or error.get("error") or "Upstream stream error"
+    message = str(raw_message)
+    code = error.get("code")
+    text = message.lower()
+    status = 429 if code == 8 or "too many requests" in text or "rate limit" in text else 502
+
+    try:
+        body = orjson.dumps(obj).decode()
+    except (TypeError, ValueError):
+        body = str(obj)
+
+    return UpstreamError(
+        f"Upstream stream error: {message}",
+        status=status,
+        body=body[:400],
+    )
+
+
+def raise_for_stream_error(data: str | bytes | dict[str, Any]) -> None:
+    """Raise :class:`UpstreamError` for raw or decoded in-band stream errors."""
+    if isinstance(data, dict):
+        obj = data
+    else:
+        try:
+            obj = orjson.loads(data)
+        except (orjson.JSONDecodeError, ValueError, TypeError):
+            return
+    if not isinstance(obj, dict):
+        return
+    exc = stream_error_from_payload(obj)
+    if exc is not None:
+        raise exc
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +300,7 @@ class StreamAdapter:
             obj = orjson.loads(data)
         except (orjson.JSONDecodeError, ValueError, TypeError):
             return []
+        raise_for_stream_error(obj)
 
         result = obj.get("result")
         if not result:
